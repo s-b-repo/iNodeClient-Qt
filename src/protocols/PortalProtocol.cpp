@@ -49,8 +49,25 @@ static constexpr quint8 ATTR_CHAPPASSWORD  = 0x04;
 static constexpr quint8 ATTR_TEXTINFO      = 0x05;
 static constexpr quint8 ATTR_IPCONFIG      = 0x06;
 static constexpr quint8 ATTR_BASEIP        = 0x07;
-// H3C proprietary TLV-dialect attributes (beyond the standard 1–7).
-static constexpr quint8 ATTR_USERMAC       = 0x0A;   // client MAC (6 bytes)
+
+// ---- H3C proprietary dialect (libInodePortalPt.so) ----
+// Private opcode space (header byte at offset 1), not the standard 0x01–0x07.
+static constexpr quint8 H3C_LOGIN_REQUEST  = 0x64;
+static constexpr quint8 H3C_LOGIN_RESPONSE = 0x65;
+static constexpr quint8 H3C_LOGOUT_REQUEST = 0x66;
+static constexpr quint8 H3C_HANDSHAKE      = 0x68;   // heartbeat
+static constexpr quint8 H3C_HASH_RESPONSE  = 0x7A;   // client→server (anti-track)
+// H3C attribute type codes (TLV: Type, Len=value+2, Value).
+static constexpr quint8 H3C_ATTR_BAS_IP    = 0x0A;   // NB: 0x0A is BAS_IP, *not* user-mac
+static constexpr quint8 H3C_ATTR_RELAY     = 0x21;   // base64 product-version / ip-config blob
+static constexpr quint8 H3C_ATTR_ENCRYPT   = 0x38;   // EX_ATTR_ENCRYPT_ENABLE / MsgAuth
+static constexpr quint8 H3C_ATTR_USER_NAME = 0x65;
+static constexpr quint8 H3C_ATTR_PASSWORD  = 0x66;
+static constexpr quint8 H3C_ATTR_PRIVATE_IP = 0x67;  // 16-byte IP blob
+static constexpr quint8 H3C_ATTR_PUBLIC_IP  = 0x68;  // 16-byte IP blob
+static constexpr quint8 H3C_ATTR_START_TIME = 0x71;  // 4-byte BE timestamp
+static constexpr quint8 H3C_ATTR_HASH_KEY   = 0x82;  // server→client challenge key
+static constexpr quint8 H3C_ATTR_HASH_VALUE = 0x83;  // client→server 32-byte response
 
 static QByteArray md5(const QByteArray& in) {
     return QCryptographicHash::hash(in, QCryptographicHash::Md5);
@@ -124,9 +141,9 @@ void PortalProtocol::connectWith(const Profile& profile) {
     if (m_dialect == 1) {
         m_userMac = macFromIface(profile.iface);
         Logger::instance().info(tr(
-            "Portal: H3C TLV dialect (experimental) — appending proprietary "
-            "attributes (user-mac%1). Capture a working client if a deployment "
-            "needs additional TLVs.").arg(m_userMac.isEmpty() ? tr(" unavailable") : QString()));
+            "Portal: H3C proprietary dialect (experimental, untested) — single-shot "
+            "LOGIN_REQUEST (0x64) with H3C attributes. The anti-track hash challenge "
+            "is acknowledged best-effort only."));
     }
 
     m_host   = profile.serverHost;
@@ -156,7 +173,8 @@ void PortalProtocol::connectWith(const Profile& profile) {
     connect(m_sock, &QUdpSocket::readyRead, this, &PortalProtocol::onDatagram);
 
     setState(ConnectionState::Connecting);
-    sendChallenge();
+    if (m_dialect == 1) sendH3cLogin();
+    else                sendChallenge();
 }
 
 void PortalProtocol::sendChallenge() {
@@ -190,14 +208,9 @@ void PortalProtocol::sendAuth(const QByteArray& challenge) {
     QByteArray pkt = buildHeader(TYPE_REQ_AUTH, 0x00 /* CHAP */, m_serialNo, m_reqId, m_userIp);
 
     QByteArray attrs;
-    quint8 attrNum = 2;
+    const quint8 attrNum = 2;
     appendAttr(attrs, ATTR_USERNAME, m_user.toUtf8());
     appendAttr(attrs, ATTR_CHAPPASSWORD, chapPw);
-    // H3C TLV dialect: append the proprietary client-MAC attribute.
-    if (m_dialect == 1 && m_userMac.size() == 6) {
-        appendAttr(attrs, ATTR_USERMAC, m_userMac);
-        ++attrNum;
-    }
     pkt[15] = static_cast<char>(attrNum); // attrNum
 
     QByteArray full = pkt + attrs;
@@ -237,6 +250,7 @@ void PortalProtocol::onDatagram() {
         const auto dg = m_sock->receiveDatagram();
         const QByteArray data = dg.data();
         if (data.size() < 32) { Logger::instance().warn(QStringLiteral("Portal: short packet")); continue; }
+        if (m_dialect == 1) { handleH3cPacket(data); continue; }
         const quint8 type = static_cast<quint8>(data.at(1));
         const quint8 err  = static_cast<quint8>(data.at(14));
 
@@ -296,14 +310,153 @@ void PortalProtocol::onDatagram() {
 void PortalProtocol::onKeepAlive() {
     // Portal v2 doesn't mandate a dedicated keep-alive packet; re-sending the
     // affirm keeps NAT mappings open and lets us detect a dropped server.
-    sendAffirm();
+    if (m_dialect == 1) sendH3cHeartbeat();
+    else                sendAffirm();
+}
+
+// ---------------------------------------------------------------------------
+// H3C proprietary dialect
+// ---------------------------------------------------------------------------
+
+// A 16-byte IP blob (IPv4 left-aligned, zero-padded) for PRIVATE_IP/PUBLIC_IP.
+static QByteArray ipBlob16(const QByteArray& ip4) {
+    QByteArray b(16, '\0');
+    std::memcpy(b.data(), ip4.constData(), qMin(4, ip4.size()));
+    return b;
+}
+
+void PortalProtocol::sendH3cLogin() {
+    m_step = Step::Auth;
+    QByteArray pkt = buildHeader(H3C_LOGIN_REQUEST, 0x01 /* PAP */, m_serialNo, m_reqId, m_userIp);
+
+    QByteArray attrs;
+    quint8 attrNum = 0;
+    const auto add = [&](quint8 t, const QByteArray& v) { appendAttr(attrs, t, v); ++attrNum; };
+
+    // Observed login attribute order: 0x21 → 0x67 → 0x68 → 0x65 → 0x66 → 0x71.
+    // The 0x21 relay blob is a base64 product-version/ip-config struct; we send
+    // a minimal client-version marker (full struct layout is UNCONFIRMED).
+    add(H3C_ATTR_RELAY,      QByteArrayLiteral("iNodeClient-Qt").toBase64());
+    add(H3C_ATTR_PRIVATE_IP, ipBlob16(m_userIp));
+    add(H3C_ATTR_PUBLIC_IP,  ipBlob16(m_userIp));
+    add(H3C_ATTR_USER_NAME,  m_user.toUtf8());
+    add(H3C_ATTR_PASSWORD,   m_pass.toUtf8());          // PAP: plaintext (inside trusted net)
+    add(H3C_ATTR_BAS_IP,     m_userIp);                 // best-effort: our own IP as BAS hint
+    QByteArray ts(4, '\0');
+    qToBigEndian<quint32>(static_cast<quint32>(QDateTime::currentSecsSinceEpoch()),
+                          reinterpret_cast<uchar*>(ts.data()));
+    add(H3C_ATTR_START_TIME, ts);
+
+    pkt[15] = static_cast<char>(attrNum);
+    QByteArray full = pkt + attrs;
+    QByteArray forHash = full + m_secret.toUtf8();
+    std::memcpy(full.data() + 16, md5(forHash).constData(), 16);
+
+    Logger::instance().info(tr("Portal(H3C): LOGIN_REQUEST user='%1' (%2 attrs)")
+                                .arg(m_user).arg(attrNum));
+    const auto addr = QHostInfo::fromName(m_host).addresses().value(0, QHostAddress(m_host));
+    m_sock->writeDatagram(full, addr, m_port);
+    setState(ConnectionState::Authenticating);
+}
+
+void PortalProtocol::sendH3cHeartbeat() {
+    QByteArray pkt = buildHeader(H3C_HANDSHAKE, 0x01, m_serialNo, m_reqId, m_userIp);
+    QByteArray attrs;
+    appendAttr(attrs, H3C_ATTR_BAS_IP, m_userIp);
+    pkt[15] = 1;
+    QByteArray full = pkt + attrs;
+    QByteArray forHash = full + m_secret.toUtf8();
+    std::memcpy(full.data() + 16, md5(forHash).constData(), 16);
+    const auto addr = QHostInfo::fromName(m_host).addresses().value(0, QHostAddress(m_host));
+    m_sock->writeDatagram(full, addr, m_port);
+}
+
+void PortalProtocol::sendH3cLogout() {
+    if (!m_sock) return;
+    QByteArray pkt = buildHeader(H3C_LOGOUT_REQUEST, 0x01, m_serialNo, m_reqId, m_userIp);
+    QByteArray attrs;
+    appendAttr(attrs, H3C_ATTR_USER_NAME, m_user.toUtf8());
+    appendAttr(attrs, H3C_ATTR_BAS_IP, m_userIp);
+    pkt[15] = 2;
+    QByteArray full = pkt + attrs;
+    QByteArray forHash = full + m_secret.toUtf8();
+    std::memcpy(full.data() + 16, md5(forHash).constData(), 16);
+    const auto addr = QHostInfo::fromName(m_host).addresses().value(0, QHostAddress(m_host));
+    m_sock->writeDatagram(full, addr, m_port);
+    Logger::instance().info(QStringLiteral("Portal(H3C): LOGOUT_REQUEST sent"));
+}
+
+// Best-effort answer to the H3C anti-track hash challenge: echo MD5(hashKey ||
+// secret) as the 32-byte response. The real digest is a function-code-dispatched
+// MD5 we did not fully recover, so this is unlikely to satisfy a strict BAS.
+void PortalProtocol::replyH3cHashChallenge(const QByteArray& data) {
+    QByteArray hashKey;
+    int off = 32;
+    while (off + 2 <= data.size()) {
+        const quint8 t = static_cast<quint8>(data.at(off));
+        const quint8 l = static_cast<quint8>(data.at(off + 1));
+        if (l < 2 || off + l > data.size()) break;
+        if (t == H3C_ATTR_HASH_KEY) hashKey = data.mid(off + 2, l - 2);
+        off += l;
+    }
+    QByteArray resp = md5(hashKey + m_secret.toUtf8());
+    resp.append(md5(resp + m_secret.toUtf8()));  // pad to 32 bytes
+    resp.truncate(32);
+
+    QByteArray pkt = buildHeader(H3C_HASH_RESPONSE, 0x01, m_serialNo, m_reqId, m_userIp);
+    QByteArray attrs;
+    appendAttr(attrs, H3C_ATTR_HASH_VALUE, resp);
+    pkt[15] = 1;
+    QByteArray full = pkt + attrs;
+    QByteArray forHash = full + m_secret.toUtf8();
+    std::memcpy(full.data() + 16, md5(forHash).constData(), 16);
+    const auto addr = QHostInfo::fromName(m_host).addresses().value(0, QHostAddress(m_host));
+    m_sock->writeDatagram(full, addr, m_port);
+    Logger::instance().warn(QStringLiteral(
+        "Portal(H3C): answered anti-track hash challenge (best-effort; "
+        "exact digest not recovered)."));
+}
+
+void PortalProtocol::handleH3cPacket(const QByteArray& data) {
+    const quint8 type = static_cast<quint8>(data.at(1));
+    const quint8 err  = static_cast<quint8>(data.at(14));
+
+    if (type == H3C_HASH_RESPONSE - 1 || type == H3C_HASH_RESPONSE) {
+        // Some builds use 0x79 for HASH_REQUEST; the 0x82 attr is the tell.
+        replyH3cHashChallenge(data);
+        return;
+    }
+    if (type == H3C_LOGIN_RESPONSE) {
+        if (err != 0) {
+            emit errorOccurred(tr("Portal(H3C): login rejected (code %1)").arg(err));
+            setState(ConnectionState::Failed);
+            return;
+        }
+        ConnectionStats s;
+        s.localIp     = QHostAddress(qFromBigEndian<quint32>(m_userIp.constData())).toString();
+        s.connectedAt = QDateTime::currentDateTime();
+        setStats(s);
+        setState(ConnectionState::Connected);
+        if (!m_keepAlive) {
+            m_keepAlive = new QTimer(this);
+            m_keepAlive->setInterval(45 * 1000);
+            connect(m_keepAlive, &QTimer::timeout, this, &PortalProtocol::onKeepAlive);
+        }
+        m_keepAlive->start();
+        m_step = Step::KeepAlive;
+        Logger::instance().info(QStringLiteral("Portal(H3C): login accepted"));
+        return;
+    }
+    Logger::instance().info(tr("Portal(H3C): opcode 0x%1 (err %2)")
+                                .arg(type, 0, 16).arg(err));
 }
 
 void PortalProtocol::disconnect() {
     if (!m_sock) return;
     setState(ConnectionState::Disconnecting);
     if (m_keepAlive) m_keepAlive->stop();
-    sendLogout();
+    if (m_dialect == 1) sendH3cLogout();
+    else                sendLogout();
     // Give the server a moment to reply; then tear down regardless.
     QTimer::singleShot(1500, this, [this] {
         if (m_sock) { m_sock->close(); m_sock->deleteLater(); m_sock = nullptr; }

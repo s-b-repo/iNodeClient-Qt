@@ -14,12 +14,19 @@ namespace inode {
 //   - standard GB/T 28181 (Portal v2) — UDP/2000 by default. Fully on the
 //     wire here: REQ_CHALLENGE → ACK_CHALLENGE → REQ_AUTH → ACK_AUTH →
 //     AFF_ACK_AUTH, with MD5 checksums keyed on the shared secret.
-//   - H3C proprietary TLV extensions — still stubbed. The packet frame
-//     lives below but the H3C-specific attribute layout and the H3C
-//     "智能感知" challenge machinery are not yet implemented.
+//   - H3C proprietary dialect — recovered from libInodePortalPt.so. NOT just
+//     "v2 plus a TLV": it uses a private opcode space (LOGIN=0x64, LOGOUT=0x66,
+//     HANDSHAKE=0x68, …) and a distinct attribute set (BAS_IP=0x0A,
+//     USER_NAME=0x65, USER_PASSWORD=0x66, PRIVATE_IP=0x67, PUBLIC_IP=0x68,
+//     START_TIME=0x71, …). The 32-byte header and the MD5 authenticator
+//     (= MD5(packet-with-auth-zeroed || shared_secret)) are shared with v2.
+//     Implemented best-effort and UNTESTED against a live H3C Portal (we have
+//     none). The H3C "anti-track" hash challenge (server attr 0x82 → 32-byte
+//     client attr 0x83) is acknowledged best-effort only; its exact digest
+//     (a function-code-dispatched MD5) was not fully recovered.
 //
-// The wire format follows the portal-v2 protocol ("Portal 2.0") that H3C
-// documents publicly; many iMC/EIA Portal deployments accept a v2 client
+// The standard wire format follows the portal-v2 protocol ("Portal 2.0") that
+// H3C documents publicly; many iMC/EIA Portal deployments accept a v2 client
 // as long as the shared secret matches.
 class PortalProtocol : public IProtocol {
     Q_OBJECT
@@ -42,6 +49,13 @@ private:
     void sendLogout();
     void onDatagram();
     void onKeepAlive();
+
+    // H3C proprietary dialect (m_dialect == 1).
+    void sendH3cLogin();
+    void sendH3cLogout();
+    void sendH3cHeartbeat();
+    void handleH3cPacket(const QByteArray& data);
+    void replyH3cHashChallenge(const QByteArray& data);
 
     QUdpSocket* m_sock     = nullptr;
     QTimer*     m_keepAlive = nullptr;

@@ -9,6 +9,17 @@ Audit pass over the UI/protocol layer: wired up controls that were collected but
 ignored, fixed a credential-exposure issue, and corrected misleading labels.
 
 ### Added
+- **Standalone EAD (iMC SEC) posture protocol implemented.** `EadProtocol` is no
+  longer a stub: it speaks the UDP/9019 SEC protocol reverse-engineered from
+  `libInodeSecurityAuth.so` (unstripped + DWARF). Pure Qt/C++ (no privileges, same
+  shape as `PortalProtocol`): the 28-byte SEC header (`ulPktHeadId` bytes
+  `00 0A D8 77`, big-endian length/pktId/opcode), the keyed-MD5 checksum over the
+  hardcoded seed `SC-EAD_Server$REQ&ShareKey@9019`, a **compliant** XML posture
+  body (`<i n="...">` items, empty `*checkResult` = pass) with identity fields,
+  and the `SEC_START(1) → CHECK_LIST(2) → CHECK_RESULT(3) → SUCCESS(4)/FAIL(6) →
+  HEARTBEAT(17)` state machine. Sends unencrypted bodies (the handshake is
+  unencrypted per `GetPktEncryType`). **Untested against a live iMC EIA server**
+  (we have none); framing/checksum/schema are byte-faithful to the binary.
 - **Portable secure credential storage.** Added a freedesktop **Secret Service**
   backend (libsecret, `dlopen`'d at runtime — no build dependency) tried after
   KWallet and before the obfuscated fallback. This gives real keyring-backed
@@ -79,6 +90,26 @@ ignored, fixed a credential-exposure issue, and corrected misleading labels.
     `org.inode.ClientQt.ipcfg`, driven by `core/IpConfigurator`.
 
 ### Changed
+- **H3C Portal dialect rewritten to match the binary.** Reverse-engineering
+  `libInodePortalPt.so` (unstripped + DWARF) showed the previous "H3C TLV
+  dialect" was wrong: it appended a `0x0A` *user-mac* TLV to standard Portal v2,
+  but in the binary **`0x0A` is `ATTR_PORTAL_BAS_IP`** and `0x0F`/`0x13` are not
+  wire attributes at all. The H3C dialect is a separate proprietary protocol —
+  private opcode space (`LOGIN=0x64`, `LOGOUT=0x66`, `HANDSHAKE=0x68`, …) and a
+  distinct attribute set (`USER_NAME=0x65`, `USER_PASSWORD=0x66`,
+  `PRIVATE_IP=0x67`, `PUBLIC_IP=0x68`, `START_TIME=0x71`, …) over the shared
+  32-byte header + `MD5(packet-auth-zeroed ‖ secret)` authenticator.
+  `PortalProtocol` (dialect == 1) now builds a real `LOGIN_REQUEST(0x64)`,
+  `HANDSHAKE(0x68)` keep-alive and `LOGOUT_REQUEST(0x66)`, and answers the
+  anti-track hash challenge (`0x82` → `0x83`) best-effort. **Untested vs. a live
+  H3C Portal.** The standard GB/T 28181 v2 path is unchanged.
+- **SPA `declaredLen` endianness fixed.** `onKnockUDPMsg` stores `0x0110` in
+  **native little-endian** (wire bytes `10 01`); `spa.py` was emitting it
+  big-endian (`01 10`). Also re-confirmed via `generateOTP` @0x1bd70 that the
+  HOTP counter is the **random** `rand()` value (not time/event-based) and is the
+  same value byte-swapped into `pktID` — so the existing `pkt_id`-as-counter
+  encoding is already byte-identical to the client. Documented the full 10-field
+  `pc/userLogin` registration JSON.
 - **SPA knock `portCount` corrected.** Reverse-engineering `libZeroTrust.so`
   (`onKnockUDPMsg`) confirmed `portCount = len(ports)`; the previous `(n//2)+1`
   guess was wrong for 3+ knock ports (1–2 port cases were unaffected). Also

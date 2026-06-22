@@ -47,17 +47,46 @@ Each iMC Portal deployment ships with:
 
 The **v2 standard** dialect is on the wire here. The **H3C TLV** dialect is now wired up experimentally — see below.
 
-## H3C Portal (TLV dialect) — 🧪 experimental
+## H3C Portal (proprietary dialect) — 🧪 experimental (faithful framing, untested)
 
-**Wire protocol reference:** `libInodePortalPt.so` in the original client. H3C's Portal extends the GB/T 28181 Portal standard with proprietary TLVs.
+**Wire protocol reference:** `libInodePortalPt.so` (unstripped + DWARF) in the
+original client, fully reverse-engineered. **Correction to earlier notes:** the
+H3C dialect is *not* "Portal v2 plus a `0x0A` user-mac TLV". In this binary
+`0x0A` is `ATTR_PORTAL_BAS_IP`, and `0x0F`/`0x13` are not wire attributes at all.
+The dialect is a **separate proprietary protocol** sharing only the 32-byte
+header and MD5 authenticator with v2.
 
-**Status.** `PortalProtocol::sendAuth()` now appends the documented H3C TLV(s) when `profile.portalDialect == 1` — currently the **user-mac** attribute (type `0x0A`), taken from the profile's interface. This is **best-effort and untested against a live H3C Portal** (we have none): some deployments also need `0x0F` (challenge-type), `0x13` (auth-vlan) and a checksum variant, whose exact layout requires a packet capture from the original client.
+**What was recovered (and implemented in `PortalProtocol`, dialect == 1):**
 
-**To finish for a specific deployment:**
+- **Private opcode space** (header byte +1): `LOGIN_REQUEST=0x64`,
+  `LOGIN_RESPONSE=0x65`, `LOGOUT_REQUEST=0x66`, `HANDSHAKE`(heartbeat)`=0x68`,
+  `DOMAIN_REQUEST=0x6E`, `NTF_USERDISCOVER=0x74`, `HASH_RESPONSE=0x7A` — not the
+  standard `0x01–0x07`.
+- **Header:** version-driven size (v1=16, **v2=32**, v3=48); v2 = 16-byte base +
+  16-byte authenticator at +0x10. Big-endian numerics.
+- **Authenticator:** `MD5(packet-with-auth-field-zeroed ‖ shared_secret)` (plain
+  MD5, not HMAC) written into +0x10 — same algorithm v2 already used here.
+- **TLV:** `Type(1) | Length=ValueLen+2 (1) | Value`; body cap 1352 B.
+- **Attributes:** `BAS_IP=0x0A`, `RELAY(version/ip-config base64)=0x21`,
+  `ENCRYPT_ENABLE=0x38`, `USER_NAME=0x65`, `USER_PASSWORD=0x66`,
+  `PRIVATE_IP=0x67` (16-byte blob), `PUBLIC_IP=0x68` (16-byte blob),
+  `START_TIME=0x71` (4-byte BE). Login attr order: `0x21 → 0x67 → 0x68 → 0x65 →
+  0x66 → 0x38 → 0x71`.
+- **Anti-track hash challenge:** server sends attr `0x82` (encrypted hash key);
+  client must return a 32-byte value in attr `0x83` (opcode `0x7A`). The digest
+  is a function-code-dispatched MD5 (`CalculateHashValue`, "anti track") that was
+  **not fully recovered** — `PortalProtocol::replyH3cHashChallenge()` answers
+  best-effort (`MD5(key‖secret)` padded to 32 B) and logs a warning; a strict BAS
+  will reject it.
 
-1. Capture a successful auth from the original client. Expect UDP to port 50100 plus optional HTTP redirects.
-2. Confirm the extra attribute types/values and the checksum variant, then extend `sendAuth()` accordingly.
-3. Some H3C builds change the shared secret to an iMC-generated string (check `custom/clientfiles/5020/*.icnf`).
+**Status.** `PortalProtocol` (dialect == 1) now sends a real H3C
+`LOGIN_REQUEST(0x64)` with the correct attributes/header/authenticator, runs a
+`HANDSHAKE(0x68)` keep-alive, and tears down with `LOGOUT_REQUEST(0x66)`. This is
+**best-effort and untested against a live H3C Portal** (we have none). Remaining
+unknowns needing a packet capture: the exact `0x21` relay-blob struct, the
+PAP/CHAP password encoding switch (PAP plaintext is sent), the anti-track hash
+digest, and the numeric values of the RESPONSE/CHALLENGE opcodes (only the
+REQUEST builders hardcode constants in the binary).
 
 ## SSL VPN (port 7000) — ✅ working (via the bundled `h3csvpn` backend)
 
@@ -82,7 +111,7 @@ Flow (`backends/h3csvpn`; full spec in `docs/PROTOCOL.md` of the h3c-svpn source
 
 **Limitations (inherited from the backend):** GM/SM2 (CNTLS / SKF UKey) gateways are TLS-layer-only (unsupported); Zero-Trust SDP registration that issues the per-client SPA key is out of scope (only the knock builder exists).
 
-## EAD (port 9019) — 🧪 host-check ack done; standalone posture *forgeable* (not yet built)
+## EAD (port 9019) — 🧪 host-check ack done; standalone posture **implemented** (untested vs live iMC)
 
 **Wire protocol reference:** `libInodeSecurityAuth.so` (`CreatePkt` @0x45cd0, `VerifyPkt` @0x44450, `PushSecurityResult` @0x46250).
 
@@ -95,12 +124,24 @@ Flow (`backends/h3csvpn`; full spec in `docs/PROTOCOL.md` of the h3c-svpn source
 
 > Both seals are **constant across all clients and sessions** (recovered from `libInodeSecurityAuth.so`). **Correction:** `libwacollector.so` is OPSWAT's **OESIS V4** collector, and the RSA/AES/cert material embedded in it is for OPSWAT's *own* module/cache integrity — it is **not** used to sign the H3C posture report. So there is no vendor signing key gating this at all.
 
-Both seals are constant across all clients/sessions (no per-session derivation), so a clean-room client can build a valid `SEC_CHECK_RESULT` the server accepts. The 28-byte SEC header is `ulPktHeadId u32 · usPktHeadLen u16 · checkSum[16] @+6 · … · body @0x1c`; the body is an XML envelope of `<i n="field">value</i>` items (result fields `PMcheckResult/AVexception/FWcheckResult/HDcheckResult/passwordCheckResult/screenSaverResult/…` plus identity/asset fields). Flow is `SEC_START(1) → server SEC_CHECK_LIST(2) → SEC_CHECK_RESULT(3) → SUCCESS(4)/FAIL(6) → ACL_REQUEST(97) → HEARTBEAT(17)/MONITOR(7)`. So the remaining work is **transcribing the `<i n="…">` result-field set into a passing `SEC_CHECK_RESULT` and walking the handshake** — not breaking crypto, and no OPSWAT engine needed for a forgery. A dummy "compliant" posture is implementable; it is just not built yet (and we have no iMC EIA server to test against). The standalone `EadProtocol` reports this and points at the SSL VPN host-check above.
+Both seals are constant across all clients/sessions (no per-session derivation), so a clean-room client can build a valid `SEC_CHECK_RESULT` the server accepts.
+
+**Now implemented** in `EadProtocol` (pure Qt/C++, UDP, no privileges — same shape as `PortalProtocol`). Recovered and built faithfully:
+
+- **Header (28 bytes), confirmed against `CreatePkt` @0x45cd0 / `SecDataProcess` @0x72320:** `ulPktHeadId` = wire bytes `00 0A D8 77` (+0); `usPktHeadLen` u16 **big-endian** (+4); `checkSum[16]` (+6); `pktId` u32 **big-endian** (+22, correlator); **opcode** u16 **big-endian** (+26) — the message type lives here, *not* in `ulPktHeadId`; body at +28.
+- **Checksum:** `MD5(packet-with-16-byte-cksum-zeroed ‖ "SC-EAD_Server$REQ&ShareKey@9019")` (31-byte seed, no NUL) written back at +6.
+- **Body:** `<?xml version="1.0" encoding="UTF-8"?><msg><ver></ver><content><data> … <i n="NAME">value</i> … </data></content></msg>`. Each `*checkResult` field **empty == pass** (the binary only appends a fault token on failure). `EadProtocol::buildPostureXml()` emits a compliant posture plus identity (`userName/hwAddr/ipAddr/hostname/osType/OSInfo/OSKernelVersion/arch/clientVersion`).
+- **State machine:** `SEC_START(1)` (carrying the posture) → on `SEC_CHECK_LIST(2)` resend as `SEC_CHECK_RESULT(3)` → `SEC_CHCK_SUCCESS(4)` ⇒ connected + `SEC_HEARTBEAT(17)` keep-alive, or `SEC_CHECK_FAIL(6)` ⇒ fail; `SEC_OFFLINE(19)` on disconnect. Opcodes confirmed against `PacketMatching` @0x445c0.
+- **Body cipher:** ECB-XTEA (Δ `0x9E3779B9`, 16 rounds, body key `{0x35469812,0x83479025,0x23192486,0x36615829}` — distinct from the general `g_arruiKey`) is **only** negotiated for later, post-handshake packets. `GetPktEncryType` returns 0 (no encryption) for the initial handshake, so `EadProtocol` sends **unencrypted** bodies and does not implement the cipher.
+
+**Untested** against a live iMC EIA server (we have none). Remaining unknowns: exact `*exception` literal values, server-supplied heartbeat/monitor intervals (defaults assumed), and whether a deployment mandates body encryption mid-session. The SSL VPN host-check above remains the verified path.
 
 ## SDP (port 19006) — 🧪 experimental (SPA knock + SSL VPN)
 
 SDP (software-defined perimeter) is, in H3C's stack, an **SSL VPN preceded by a Single-Packet-Authorization (SPA) knock** that opens the otherwise-closed gateway port. That is now wired up: an **SDP** profile (or any SSL VPN profile with the *SPA key/AID/ports* filled in) sends the RFC-4226-HOTP knock — `backends/h3csvpn/spa.py`, validated 47-byte packet — before the TLS/auth flow (`--spa-key/--spa-aid/--spa-ports/--spa-knock-port`).
 
-Verified against `libZeroTrust.so` (`onKnockUDPMsg` @0x22630): packet is `declaredLen=0x0110` · `aid[32]` · `pktID=bswap(rand)` · `password[6]` (HMAC-SHA1 HOTP, 5 digits + Luhn check) · `portCount=len(ports)` · ports (htons); knock is fire-and-forget UDP. Ports: register 19006, knock 59993, gateway-knock 8000. Our builder matches byte-for-byte (the earlier `portCount=(n//2)+1` guess is fixed to `len(ports)`).
+Verified against `libZeroTrust.so` (`onKnockUDPMsg` @0x22630, `generateOTP` @0x1bd70): packet is `declaredLen=0x0110` (written **native little-endian** → bytes `10 01`) · `aid[32]` (raw string bytes) · `pktID=bswap(rand)` · `password[6]` · `portCount` · ports (htons); fire-and-forget UDP to **hardcoded dst port 8000** (`knockPort` is a separate packet field). Register port 19006 / knock 59993 are **config-supplied**, not constants in this binary.
 
-**Out of scope:** the SDP **registration** that mints the per-client `clientKey`/`aid`. Per the binary it is **not** a dedicated `/register` call — it rides on the first auth: `POST https://<gw>/api/terminal/pc/userLogin` with JSON `{userAccount, userPassword, clientSn, clientMac, clientOsType}`; the response carries `clientAid`/`clientKey` (cached in `/etc/spa/spa_cfg.cnf` as `SdpAid-<ip>`/`SdpKey-<ip>`). Reproducible structurally but needs valid gateway credentials — supply the AID/key from an enrolled client.
+- **Password = `generateOTP(clientKey, counter, digits=5, addLuhn=1)`**: HMAC-SHA1 over an **8-byte big-endian counter**, RFC-4226 dynamic truncation, `mod 100000` (5 digits) **+ 1 Luhn check digit** ⇒ 6 ASCII digits. **Correction:** the counter is a **random** value (`(int)rand()`), *not* time- or event-based; the **same `rand()`** value is byte-swapped to form `pktID`, so the gateway recovers the counter from `pktID`. (`spa.py` already produces byte-identical output: a random `pkt_id` packed big-endian on the wire and fed to HOTP as the counter.)
+
+**Out of scope:** the SDP **registration** that mints the per-client `clientKey`/`aid`. Per `AssemblePwdAuthReq` @0x19160 / `ParsePwdAuthResp` @0x1e2a0 it rides on the first auth: `POST https://<gw>/api/terminal/pc/userLogin` with JSON carrying **10 fields** — `userAccount, userPassword, clientSn, clientMac, clientAid, clientPrivate, clientVersion, clientSrcIp, clientOSInfo, clientOsType` (last is an int); the response `data.clientAid`/`data.clientKey` (and `firstAuthToken`) are cached in `/etc/spa/spa_cfg.cnf` as `SdpAid-<ip>`/`SdpKey-<ip>`. Reproducible structurally but needs valid gateway credentials — supply the AID/key from an enrolled client.
