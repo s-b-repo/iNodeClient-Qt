@@ -1,0 +1,33 @@
+# Build output
+/build/
+*.o
+*.a
+*.so
+*.so.*
+*.qm
+*_autogen/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors / OS
+*.swp
+*~
+.idea/
+.vscode/
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Backups / scratch
+*.bak
+*.bak-*
+*.orig
+.backups/
+
+# Never publish the original proprietary H3C client artifacts
+iNodeClient/
+*.tar.gz
+lib64*/
