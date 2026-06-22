@@ -23,7 +23,8 @@ ignored, fixed a credential-exposure issue, and corrected misleading labels.
     engineering `libInodeSecurityAuth.so` revised the standalone iMC posture
     verdict: it is **not** crypto-blocked — the UDP/9019 SEC packet is sealed
     only by a hardcoded keyed-MD5 seed `SC-EAD_Server$REQ&ShareKey@9019` and a
-    static XTEA key, both recovered — so a dummy posture is *feasible*; the
+    static XTEA key, both recovered — and the OPSWAT collector does not sign the
+    report at all — so a dummy posture is *feasible*; the
     remaining work is the result schema + SEC state machine, not breaking crypto.
     `EadProtocol`/docs now say so. Not yet built; no iMC server to test against.)
   - **SDP** — now a selectable protocol = SSL VPN preceded by a Single-Packet-

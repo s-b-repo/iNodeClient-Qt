@@ -161,6 +161,16 @@ The protocol surface (`IProtocol`) is deliberately small so each of the stub pro
 - **Not yet** connection-compatible with H3C's Portal TLV dialect or EAD — those
   require separate reverse-engineering work per protocol. PRs welcome.
 
-## License
+## License — fully free / open source
 
-The Qt code in this tree is original and may be redistributed under the terms of GPL-3.0-or-later. The original H3C iNode binaries it aims to replace are *not* redistributed here.
+Licensed **GPL-3.0-or-later** (full text in [`LICENSE`](LICENSE)). This repository is
+**100% FOSS** and self-contained:
+
+- All Qt/KF6 code is original.
+- The SSL VPN backend (`backends/h3csvpn/`) is a **clean-room** pure-Python
+  reimplementation — no decompiled or vendor code.
+- **No proprietary H3C binaries are included or redistributed** (they are
+  `.gitignore`d). The app links none of them at build or runtime; it speaks the
+  protocols over the wire instead.
+- `docs/PROTOCOLS.md` documents the wire formats and constants recovered by
+  reverse-engineering for **interoperability** — protocol facts, not vendor code.
