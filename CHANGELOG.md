@@ -129,6 +129,25 @@ ignored, fixed a credential-exposure issue, and corrected misleading labels.
   than unbounded.
 
 ### Fixed
+- **Security: CAPTCHA BMP decoder out-of-memory (the observed SIGKILL/137).**
+  `decode_bmp` allocated a `width × height` pixel matrix from attacker-controlled
+  BMP header dimensions before validating them, so a gateway (or on-path attacker
+  when TLS verification is off) serving a tiny BMP that declares enormous
+  dimensions made the process allocate many GB and get OOM-killed — on the
+  default login path, pre-auth. Dimensions are now bounded (≤4096/side, ≤1M px)
+  and checked against the body length before allocating. See
+  [`docs/SECURITY-FINDINGS.md`](docs/SECURITY-FINDINGS.md) (C1).
+- **Security: tunnel frame-reassembly buffer is now capped** (1 MiB) so a gateway
+  dribbling never-completing partial frames can't grow it unbounded (slow OOM).
+  (SECURITY-FINDINGS C2.)
+- **Security: `inode-svpn-helper` hardened against root code-execution** via an
+  unvalidated `--backend` — it now canonicalizes the path, refuses
+  transient/world-writable dirs, and refuses any group/other-writable backend so
+  a malicious `h3csvpn/` can't be loaded as root. (SECURITY-FINDINGS C3.)
+- **Security: cert-pin comparison is now constant-time** (`hmac.compare_digest`).
+- Added [`docs/SECURITY-FINDINGS.md`](docs/SECURITY-FINDINGS.md) documenting the
+  H3C protocol-design weaknesses (EAD posture forgery, Portal logout/auth
+  forgery, SPA replay, SSL VPN MITM) and this client's implementation findings.
 - **Auto-reconnect no longer hammers permanent failures.** A failed connection
   caused by a bad certificate, wrong credentials, an exhausted CAPTCHA, or an
   unsupported protocol is no longer retried on a timer (it would never succeed);
